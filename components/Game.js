@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Dimensions, StatusBar } from 'react-native';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import Animated, { useSharedValue, withSpring, useAnimatedStyle, withSequence, withTiming, runOnJS } from 'react-native-reanimated';
+import { Audio } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 
@@ -21,10 +22,39 @@ export default function Game({ onGameOver }) {
   const [particles, setParticles] = useState([]);
   const gameLoopRef = useRef(null);
   const obstacleSpeed = useRef(5);
-  // Point sound disabled until assets are added
+  const pointSound = useRef(null);
   const shake = useSharedValue(0);
+  // Levels
+  const [level, setLevel] = useState(1);
+  const levelThreshold = 10; // points per level
+  const spawnIntervalRef = useRef(null);
+  const obstacleSizeRef = useRef(OBSTACLE_WIDTH);
+  // Pausing and level-complete UI
+  const [isPaused, setIsPaused] = useState(false);
+  const [showLevelComplete, setShowLevelComplete] = useState(false);
 
-  // Sound loading removed to avoid bundling errors when file is missing
+  // Load point scoring sound
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const { sound } = await Audio.Sound.createAsync(
+          require('../assets/sounds/point.wav')
+        );
+        if (!mounted) return;
+        pointSound.current = sound;
+      } catch (e) {
+        // If asset missing, ignore
+      }
+    })();
+    return () => {
+      mounted = false;
+      if (pointSound.current) {
+        pointSound.current.unloadAsync();
+        pointSound.current = null;
+      }
+    };
+  }, []);
 
   // Player movement
   const panGesture = Gesture.Pan()
@@ -61,16 +91,30 @@ export default function Game({ onGameOver }) {
   // Generate new obstacle
   const generateObstacle = useCallback(() => {
     const colorIndex = Math.floor(Math.random() * COLORS.length);
-    const x = Math.random() * (SCREEN_WIDTH - OBSTACLE_WIDTH);
+    const size = obstacleSizeRef.current;
+    const x = Math.random() * (SCREEN_WIDTH - size);
+    // Horizontal velocity for Level 2+
+    // For Level 2, emphasize rotation (no horizontal); for Level 3+, allow horizontal
+    const vx = (typeof level !== 'undefined' && level >= 3)
+      ? ((Math.random() < 0.5 ? -1 : 1) * (1 + Math.random() * 2))
+      : 0;
+    // Rotation setup for Level 2+
+    const angle = (typeof level !== 'undefined' && level >= 2) ? Math.random() * 360 : 0;
+    const rotateSpeed = (typeof level !== 'undefined' && level >= 2)
+      ? (0.8 + Math.random() * 1.2) * (Math.random() < 0.5 ? -1 : 1)
+      : 0;
     
     return {
       id: Date.now() + Math.random(),
       x,
-      y: -OBSTACLE_WIDTH,
+      y: -size,
       color: COLORS[colorIndex],
       colorIndex,
-      width: OBSTACLE_WIDTH,
-      height: OBSTACLE_WIDTH,
+      width: size,
+      height: size,
+      vx,
+      angle,
+      rotateSpeed,
     };
   }, []);
 
@@ -78,16 +122,45 @@ export default function Game({ onGameOver }) {
   useEffect(() => {
     if (isGameOver) return;
 
-    // Spawn obstacles
-    const obstacleInterval = setInterval(() => {
-      setObstacles(prev => [...prev, generateObstacle()]);
-    }, 1200);
+    // Spawn obstacles (managed by level-dependent interval)
+    const startSpawning = () => {
+      if (spawnIntervalRef.current) clearInterval(spawnIntervalRef.current);
+      const base = 1200;
+      const rate = Math.max(500, base - (level - 1) * 100);
+      spawnIntervalRef.current = setInterval(() => {
+        if (!isPaused) {
+          setObstacles(prev => [...prev, generateObstacle()]);
+        }
+      }, rate);
+    };
+    startSpawning();
 
     // Game loop ~60fps
     gameLoopRef.current = setInterval(() => {
       setObstacles(prev => {
+        if (isPaused) return prev; // freeze game state while paused
         const updatedObstacles = prev
-          .map(obs => ({ ...obs, y: obs.y + obstacleSpeed.current }))
+          .map(obs => {
+            // Vertical movement
+            let newY = obs.y + obstacleSpeed.current;
+            // Horizontal movement for Level 2+
+            let newX = obs.x;
+            let newVx = obs.vx ?? 0;
+            if (level >= 3 && newVx !== 0) {
+              newX += newVx;
+              if (newX <= 0 || newX + obs.width >= SCREEN_WIDTH) {
+                newVx = -newVx; // bounce
+                newX = Math.max(0, Math.min(SCREEN_WIDTH - obs.width, newX));
+              }
+            }
+            // Rotation for Level 2+
+            let newAngle = obs.angle ?? 0;
+            let newRotateSpeed = obs.rotateSpeed ?? 0;
+            if (level >= 2 && newRotateSpeed !== 0) {
+              newAngle = (newAngle + newRotateSpeed) % 360;
+            }
+            return { ...obs, y: newY, x: newX, vx: newVx, angle: newAngle, rotateSpeed: newRotateSpeed };
+          })
           .filter(obs => {
             const playerRect = {
               x: playerPos.value.x,
@@ -109,7 +182,8 @@ export default function Game({ onGameOver }) {
                 // Match color - score point
                 score.current += 1;
                 setCurrentScore(score.current);
-                // Sound disabled until assets are added
+                // Play point sound if loaded
+                try { pointSound.current?.replayAsync(); } catch {}
                 // Haptics: impact on score
                 try { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
 
@@ -134,11 +208,18 @@ export default function Game({ onGameOver }) {
                   withTiming(8, { duration: 40 }),
                   withTiming(0, { duration: 120 })
                 );
+
+                // Level progression handling: for every level
+                if (score.current > 0 && score.current % levelThreshold === 0) {
+                  setIsPaused(true);
+                  setShowLevelComplete(true);
+                  try { Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
+                }
                 return false; // remove obstacle
               } else {
                 // Game over
                 clearInterval(gameLoopRef.current);
-                clearInterval(obstacleInterval);
+                if (spawnIntervalRef.current) clearInterval(spawnIntervalRef.current);
                 setIsGameOver(true);
                 setPendingGameOverScore(score.current);
                 // Haptics: notify on game over
@@ -151,9 +232,9 @@ export default function Game({ onGameOver }) {
             return obs.y < SCREEN_HEIGHT;
           });
 
-        // Increase difficulty
+        // Gradual speed ramp aside from level-ups
         if (score.current > 0 && score.current % 5 === 0) {
-          obstacleSpeed.current = Math.min(16, 5 + Math.floor(score.current / 5));
+          obstacleSpeed.current = Math.min(20, 5 + Math.floor(score.current / 4));
         }
 
         // Update particles
@@ -176,10 +257,27 @@ export default function Game({ onGameOver }) {
     }, 16);
 
     return () => {
-      clearInterval(obstacleInterval);
+      if (spawnIntervalRef.current) clearInterval(spawnIntervalRef.current);
       clearInterval(gameLoopRef.current);
     };
-  }, [isGameOver, generateObstacle, playerPos, playerColor]);
+  }, [isGameOver, generateObstacle, level, isPaused]);
+
+  // Restart spawner when level changes (if not game over)
+  useEffect(() => {
+    if (isGameOver) return;
+    if (spawnIntervalRef.current) {
+      clearInterval(spawnIntervalRef.current);
+      spawnIntervalRef.current = null;
+    }
+    const base = 1200;
+    const rate = Math.max(500, base - (level - 1) * 100);
+    spawnIntervalRef.current = setInterval(() => {
+      setObstacles(prev => [...prev, generateObstacle()]);
+    }, rate);
+    return () => {
+      if (spawnIntervalRef.current) clearInterval(spawnIntervalRef.current);
+    };
+  }, [level, isGameOver, generateObstacle, isPaused]);
 
   // Defer notifying parent about game over to avoid setState during render warning
   useEffect(() => {
@@ -207,6 +305,7 @@ export default function Game({ onGameOver }) {
 
       <Animated.View style={[StyleSheet.absoluteFill, shakeStyle]}>
         <Text style={styles.score}>Score: {currentScore}</Text>
+        <Text style={styles.level}>Level: {level}</Text>
 
         <GestureDetector gesture={panGesture}>
           <Animated.View style={[styles.player, playerStyle]} />
@@ -248,10 +347,44 @@ export default function Game({ onGameOver }) {
           <Text style={styles.colorButtonText}>Change Color</Text>
         </TouchableOpacity>
 
+        {showLevelComplete && (
+          <View style={styles.overlayContainer}>
+            <Text style={styles.levelUpTitle}>Level {level} Complete!</Text>
+            <View style={styles.overlayButtons}>
+              <TouchableOpacity
+                style={[styles.overlayButton, { backgroundColor: '#e94560' }]}
+                onPress={() => {
+                  // Quit treated as ending the run
+                  setShowLevelComplete(false);
+                  onGameOver?.(score.current);
+                }}
+              >
+                <Text style={styles.overlayButtonText}>Quit</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.overlayButton, { backgroundColor: '#4ECDC4' }]}
+                onPress={() => {
+                  // Advance to Level 2 and resume
+                  setShowLevelComplete(false);
+                  setIsPaused(false);
+                  setLevel(prev => prev + 1);
+                  obstacleSpeed.current = Math.min(20, obstacleSpeed.current + 1);
+                  obstacleSizeRef.current = Math.max(36, obstacleSizeRef.current - 4);
+                  // Optionally clear existing obstacles for a clean start
+                  setObstacles([]);
+                }}
+              >
+                <Text style={styles.overlayButtonText}>Next Level</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
         {isGameOver && (
           <View style={styles.gameOverContainer}>
             <Text style={styles.gameOverText}>Game Over!</Text>
             <Text style={styles.finalScore}>Score: {currentScore}</Text>
+            <Text style={styles.finalScore}>Level: {level}</Text>
             <TouchableOpacity
               style={styles.restartButton}
               onPress={() => {
@@ -261,6 +394,10 @@ export default function Game({ onGameOver }) {
                 setCurrentScore(0);
                 setIsGameOver(false);
                 obstacleSpeed.current = 5;
+                obstacleSizeRef.current = OBSTACLE_WIDTH;
+                setLevel(1);
+                setIsPaused(false);
+                setShowLevelComplete(false);
                 playerPos.value = { x: SCREEN_WIDTH / 2 - PLAYER_SIZE / 2, y: SCREEN_HEIGHT - 100 };
               }}
             >
@@ -285,6 +422,15 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: '#fff',
+    zIndex: 10,
+  },
+  level: {
+    position: 'absolute',
+    top: 40,
+    right: 20,
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#4ECDC4',
     zIndex: 10,
   },
   player: {
@@ -340,6 +486,35 @@ const styles = StyleSheet.create({
   restartButtonText: {
     color: 'white',
     fontSize: 20,
+    fontWeight: 'bold',
+  },
+  overlayContainer: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 25,
+    paddingHorizontal: 24,
+  },
+  levelUpTitle: {
+    fontSize: 36,
+    fontWeight: 'bold',
+    color: 'white',
+    marginBottom: 24,
+  },
+  overlayButtons: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  overlayButton: {
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    borderRadius: 24,
+    marginHorizontal: 8,
+  },
+  overlayButtonText: {
+    color: 'white',
+    fontSize: 18,
     fontWeight: 'bold',
   },
 });

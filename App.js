@@ -3,37 +3,56 @@ import { StyleSheet, View, Text, TouchableOpacity, StatusBar } from 'react-nativ
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import Game from './components/Game';
 import { Audio } from 'expo-av';
-// TEMP: AsyncStorage not installed yet; use no-op helpers to avoid bundling error
-const Storage = {
-  getItem: async () => null,
-  setItem: async () => {},
-};
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export default function App() {
   const [gameStarted, setGameStarted] = useState(false);
   const [highScore, setHighScore] = useState(0);
   const backgroundMusic = React.useRef(null);
 
-  // Load and play background music (disabled until assets are added)
+  // Play background music only while in gameplay (not on start or end screens)
   useEffect(() => {
-    let isMounted = true;
-    // Intentionally disabled to avoid bundling errors when asset files are missing.
-    // Re-enable by providing local assets at ./assets/sounds/background.mp3 (or .wav)
-    // and using Audio.Sound.createAsync(require('...')) here.
-    return () => {
-      isMounted = false;
+    let cancelled = false;
+    const ensureStopped = async () => {
       if (backgroundMusic.current) {
-        backgroundMusic.current.unloadAsync();
+        try { await backgroundMusic.current.stopAsync(); } catch {}
+        try { await backgroundMusic.current.unloadAsync(); } catch {}
         backgroundMusic.current = null;
       }
     };
-  }, []);
+    const maybeStart = async () => {
+      if (!gameStarted) {
+        await ensureStopped();
+        return;
+      }
+      try {
+        await Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
+        let soundModule;
+        try {
+          soundModule = require('./assets/sounds/background.mp3');
+        } catch (e) {
+          soundModule = require('./assets/sounds/background.wav');
+        }
+        const { sound } = await Audio.Sound.createAsync(soundModule, {
+          volume: 0.6,
+          isLooping: true,
+        });
+        if (cancelled) { try { await sound.unloadAsync(); } catch {}; return; }
+        backgroundMusic.current = sound;
+        await sound.playAsync();
+      } catch (error) {
+        console.warn('Background music not available:', error?.message || String(error));
+      }
+    };
+    maybeStart();
+    return () => { cancelled = true; };
+  }, [gameStarted]);
 
   // Load high score from storage
   useEffect(() => {
     (async () => {
       try {
-        const raw = await Storage.getItem('HIGH_SCORE');
+        const raw = await AsyncStorage.getItem('HIGH_SCORE');
         if (raw != null) {
           const parsed = JSON.parse(raw);
           if (typeof parsed === 'number' && !Number.isNaN(parsed)) {
@@ -47,12 +66,18 @@ export default function App() {
   }, []);
 
   const handleGameOver = (score) => {
+    // Stop background music on end screen
+    if (backgroundMusic.current) {
+      try { backgroundMusic.current.stopAsync(); } catch {}
+      try { backgroundMusic.current.unloadAsync(); } catch {}
+      backgroundMusic.current = null;
+    }
     if (score > highScore) {
       setHighScore(score);
       // Persist new high score
       (async () => {
         try {
-          await Storage.setItem('HIGH_SCORE', JSON.stringify(score));
+          await AsyncStorage.setItem('HIGH_SCORE', JSON.stringify(score));
         } catch (e) {
           console.warn('Failed to persist high score:', e?.message || String(e));
         }
